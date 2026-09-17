@@ -492,6 +492,9 @@ class MailPulseApp:
         self.icon.icon = make_badge_icon(0)
         self.icon.title = f"{APP_NAME} - starting..."
         self.icon.menu = pystray.Menu(
+            # default=True makes this the action pystray fires on a
+            # left-click / double-click of the tray icon (Windows).
+            pystray.MenuItem("Unread Mail", self._on_tray_left_click, default=True, visible=False),
             pystray.MenuItem("Check Mail Now", self._on_check_now),
             pystray.MenuItem("Account Breakdown", self._on_account_breakdown),
             pystray.MenuItem("Settings", self._on_settings),
@@ -503,6 +506,7 @@ class MailPulseApp:
         self._last_snapshot = {}
         self._breakdown_window = None
         self._settings_window = None
+        self._unread_list_window = None
 
     # -- background polling loop -----------------------------------------
 
@@ -540,6 +544,137 @@ class MailPulseApp:
 
     def _on_check_now(self, icon, item):
         threading.Thread(target=self._do_poll, daemon=True).start()
+
+    def _on_tray_left_click(self, icon, item):
+        if self._unread_list_window is not None:
+            return
+        threading.Thread(target=self._run_unread_list_window, daemon=True).start()
+
+    def _run_unread_list_window(self):
+        """Sleek popup listing every unread email across all accounts,
+        newest first. Clicking a row deep-links into Outlook via its
+        Message-ID."""
+        import tkinter as tk
+        from tkinter import ttk
+
+        root = tk.Tk()
+        self._unread_list_window = root
+        root.title(f"{APP_NAME} - Unread Mail")
+        root.attributes("-topmost", True)
+        root.geometry("560x460")
+        root.configure(bg="#1e1e1e")
+
+        header = tk.Frame(root, bg="#1e1e1e")
+        header.pack(fill="x", padx=16, pady=(14, 8))
+        title_label = tk.Label(
+            header, text="Unread Mail", font=("Segoe UI", 13, "bold"),
+            bg="#1e1e1e", fg="white",
+        )
+        title_label.pack(side="left")
+        count_label = tk.Label(
+            header, text="", font=("Segoe UI", 10), bg="#1e1e1e", fg="#9aa0a6"
+        )
+        count_label.pack(side="right")
+
+        container = tk.Frame(root, bg="#1e1e1e")
+        container.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        canvas = tk.Canvas(container, highlightthickness=0, bg="#1e1e1e")
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas, bg="#1e1e1e")
+
+        scroll_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw", width=520)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def on_close():
+            self._unread_list_window = None
+            root.destroy()
+
+        root.protocol("WM_DELETE_WINDOW", on_close)
+
+        def open_in_outlook(message_id, subject):
+            if self.outlook_launcher is None:
+                return
+            threading.Thread(
+                target=self.outlook_launcher.open_by_message_id,
+                args=(message_id, subject),
+                daemon=True,
+            ).start()
+
+        def render():
+            for child in scroll_frame.winfo_children():
+                child.destroy()
+
+            # Flatten every account's unread messages into one list,
+            # newest first, each tagged with its owning account.
+            rows = []
+            for account_name, status in self._last_snapshot.items():
+                for msg in status.messages:
+                    rows.append((account_name, msg))
+            rows.sort(key=lambda r: r[1].received, reverse=True)
+
+            count_label.config(text=f"{len(rows)} unread")
+
+            if not rows:
+                tk.Label(
+                    scroll_frame, text="No unread mail.", bg="#1e1e1e", fg="#9aa0a6"
+                ).pack(anchor="w", padx=8, pady=12)
+                return
+
+            for account_name, msg in rows:
+                row = tk.Frame(scroll_frame, bg="#2a2a2a", cursor="hand2")
+                row.pack(fill="x", padx=8, pady=3)
+
+                inner = tk.Frame(row, bg="#2a2a2a")
+                inner.pack(fill="x", padx=10, pady=8)
+
+                top_line = tk.Frame(inner, bg="#2a2a2a")
+                top_line.pack(fill="x")
+                tk.Label(
+                    top_line, text=msg.sender, font=("Segoe UI", 10, "bold"),
+                    bg="#2a2a2a", fg="white", anchor="w",
+                ).pack(side="left")
+                tk.Label(
+                    top_line, text=msg.received, font=("Segoe UI", 8),
+                    bg="#2a2a2a", fg="#9aa0a6", anchor="e",
+                ).pack(side="right")
+
+                tk.Label(
+                    inner, text=msg.subject, font=("Segoe UI", 9),
+                    bg="#2a2a2a", fg="#d0d0d0", anchor="w", justify="left",
+                    wraplength=480,
+                ).pack(fill="x", anchor="w", pady=(2, 0))
+
+                tk.Label(
+                    inner, text=account_name, font=("Segoe UI", 8),
+                    bg="#2a2a2a", fg="#6ea8fe", anchor="w",
+                ).pack(fill="x", anchor="w", pady=(4, 0))
+
+                # Make the whole row (and every label inside it) clickable.
+                clickable_widgets = (
+                    (row, inner, top_line)
+                    + tuple(inner.winfo_children())
+                    + tuple(top_line.winfo_children())
+                )
+                for widget in clickable_widgets:
+                    widget.bind(
+                        "<Button-1>",
+                        lambda e, mid=msg.message_id, subj=msg.subject: open_in_outlook(mid, subj),
+                    )
+
+        def auto_refresh():
+            if self._unread_list_window is None:
+                return
+            render()
+            root.after(2000, auto_refresh)
+
+        auto_refresh()
+        root.mainloop()
 
     def _on_account_breakdown(self, icon, item):
         if self._breakdown_window is not None:
