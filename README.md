@@ -44,33 +44,33 @@ seconds showing the current unread badge.
 From the project directory, run:
 
 ```bash
-pyinstaller --noconsole --onefile --name MailPulseTray --icon=NONE main.py
+pyinstaller --noconsole --onefile --name MailPulseTray ^
+  --hidden-import=win32timezone ^
+  --hidden-import=win32com ^
+  --hidden-import=win32com.client ^
+  --hidden-import=pythoncom ^
+  --hidden-import=pywintypes ^
+  --collect-submodules win32com ^
+  main.py
 ```
+
+Or just run `build.bat` from the project directory.
 
 - `--noconsole` — suppresses the terminal/console window (this is a
   background tray app).
 - `--onefile` — bundles everything into a single portable `.exe`.
-- `--icon=NONE` — omit if you have a custom `.ico` file; otherwise replace
-  with `--icon=app_icon.ico` to brand the built executable and its taskbar
-  entry. (The in-tray badge icon is generated dynamically at runtime
-  regardless of this flag.)
+- The `--hidden-import` / `--collect-submodules` flags are required because
+  `pythoncom` / `pywintypes` are compiled DLL-backed modules that
+  PyInstaller's static analysis misses by default, causing
+  `ModuleNotFoundError: No module named 'pythoncom'` at runtime otherwise.
+- Add `--icon=app_icon.ico` if you have a custom `.ico` file to brand the
+  built executable and its taskbar entry. (The in-tray badge icon is
+  generated dynamically at runtime regardless of this flag.)
 
 The compiled executable will be created at:
 
 ```
 dist\MailPulseTray.exe
-```
-
-### Notes on packaging pywin32
-
-PyInstaller usually bundles `pywin32` correctly, but if you hit COM errors
-in the frozen `.exe` (e.g. `win32com.client.gencache` issues), add:
-
-```bash
-pyinstaller --noconsole --onefile --name MailPulseTray ^
-  --hidden-import=win32timezone ^
-  --collect-submodules win32com ^
-  main.py
 ```
 
 ## 4. Run automatically at Windows startup
