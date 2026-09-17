@@ -31,6 +31,7 @@ import traceback
 from dataclasses import dataclass, field
 
 import pythoncom
+import pywintypes
 import win32com.client
 import win32gui
 import win32con
@@ -98,6 +99,25 @@ class OutlookMonitor:
         self.outlook = win32com.client.Dispatch("Outlook.Application")
         self.namespace = self.outlook.GetNamespace("MAPI")
 
+    def _force_send_receive(self):
+        """Actively trigger Outlook to fetch new mail from the server for
+        every account, instead of only reading whatever Outlook already
+        happens to have cached locally. Mirrors pressing Send/Receive All
+        Folders (F9) in Outlook."""
+        try:
+            self.namespace.SendAndReceive(False)  # False = don't show dialog
+        except Exception:
+            # Fall back to iterating each sync group explicitly if the
+            # simple call is unavailable for some Outlook configurations.
+            try:
+                for sync_object in self.namespace.SyncObjects:
+                    try:
+                        sync_object.Start()
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
     def _get_inbox_folder(self, store):
         """Return the Inbox folder for a store, matching what Outlook's
         folder-pane unread badge shows (Inbox only, not subfolders like
@@ -120,11 +140,22 @@ class OutlookMonitor:
             if self.outlook is None:
                 self.connect()
 
+            self._force_send_receive()
+
             new_events = []
             snapshot = {}
 
             with self._lock:
-                for store in self.namespace.Stores:
+                try:
+                    stores = list(self.namespace.Stores)
+                except pywintypes.com_error:
+                    # The MAPI session can drop mid-sync (e.g. Outlook was
+                    # restarted, or a transient server disconnect). Reconnect
+                    # once and retry this poll rather than crashing the loop.
+                    self.connect()
+                    stores = list(self.namespace.Stores)
+
+                for store in stores:
                     try:
                         store_name = store.DisplayName
                     except Exception:
