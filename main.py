@@ -63,12 +63,21 @@ APP_NAME = "MailPulse Tray"
 # ------------------------------------------------------------------------
 
 @dataclass
+class UnreadMessage:
+    entry_id: str
+    sender: str
+    subject: str
+    received: str  # pre-formatted display string
+
+
+@dataclass
 class AccountStatus:
     name: str
     unread: int = 0
     # EntryID/StoreID of unread items seen last cycle, used to detect
     # genuinely *new* unread mail (as opposed to a count that dropped).
     seen_entry_ids: set = field(default_factory=set)
+    messages: list = field(default_factory=list)
 
 
 # ------------------------------------------------------------------------
@@ -89,27 +98,15 @@ class OutlookMonitor:
         self.outlook = win32com.client.Dispatch("Outlook.Application")
         self.namespace = self.outlook.GetNamespace("MAPI")
 
-    def _iter_inbox_like_folders(self, store):
-        """Yield the Inbox folder for a store (root of unread tracking).
-
-        Outlook stores expose olFolderInbox per-store via GetDefaultFolder
-        on a Namespace bound to that store's root, but the simplest and
-        most reliable zero-config approach is to walk the store's root
-        folder tree and sum UnReadItemCount across all mail folders,
-        which also captures unread mail that rules moved out of Inbox.
-        """
-        root = store.GetRootFolder()
-        yield from self._walk_folders(root)
-
-    def _walk_folders(self, folder):
+    def _get_inbox_folder(self, store):
+        """Return the Inbox folder for a store, matching what Outlook's
+        folder-pane unread badge shows (Inbox only, not subfolders like
+        Archive/Trash/spam/rule-filed folders)."""
         try:
-            yield folder
-            for sub in folder.Folders:
-                yield from self._walk_folders(sub)
+            # olFolderInbox = 6
+            return store.GetDefaultFolder(6)
         except Exception:
-            # Some folders (e.g. public folders, permissions-restricted)
-            # may refuse enumeration -- skip them rather than crash.
-            return
+            return None
 
     def poll(self):
         """Refresh unread counts for every account. Returns:
@@ -135,29 +132,36 @@ class OutlookMonitor:
 
                     total_unread = 0
                     current_unread_ids = set()
+                    messages = []
 
-                    for folder in self._iter_inbox_like_folders(store):
+                    folder = self._get_inbox_folder(store)
+                    if folder is not None:
                         try:
-                            unread_count = folder.UnReadItemCount
+                            total_unread = folder.UnReadItemCount
                         except Exception:
-                            continue
-                        if unread_count <= 0:
-                            continue
-                        total_unread += unread_count
+                            total_unread = 0
 
                         # Identify the actual unread items so we can detect
-                        # "new" mail and notify with sender/subject.
+                        # "new" mail, notify with sender/subject, and show
+                        # a message list in the Account Breakdown popup.
                         try:
                             items = folder.Items
                             items = items.Restrict("[UnRead] = true")
+                            items.Sort("[ReceivedTime]", True)
                             for item in items:
                                 try:
                                     entry_id = item.EntryID
                                     current_unread_ids.add(entry_id)
+                                    messages.append(UnreadMessage(
+                                        entry_id=entry_id,
+                                        sender=self._safe_sender_name(item),
+                                        subject=getattr(item, "Subject", "(no subject)") or "(no subject)",
+                                        received=self._format_received_time(item),
+                                    ))
                                 except Exception:
                                     continue
                         except Exception:
-                            continue
+                            pass
 
                     prior = self.accounts.get(store_name)
                     prior_ids = prior.seen_entry_ids if prior else set()
@@ -184,10 +188,16 @@ class OutlookMonitor:
                         name=store_name,
                         unread=total_unread,
                         seen_entry_ids=current_unread_ids,
+                        messages=messages,
                     )
-                    snapshot[store_name] = total_unread
+                    snapshot[store_name] = AccountStatus(
+                        name=store_name,
+                        unread=total_unread,
+                        seen_entry_ids=current_unread_ids,
+                        messages=messages,
+                    )
 
-            total = sum(snapshot.values())
+            total = sum(status.unread for status in snapshot.values())
             return total, snapshot, new_events
         finally:
             pythoncom.CoUninitialize()
@@ -202,6 +212,14 @@ class OutlookMonitor:
             except Exception:
                 continue
         return "Unknown Sender"
+
+    @staticmethod
+    def _format_received_time(item):
+        try:
+            received = item.ReceivedTime
+            return received.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return ""
 
     def open_item_and_foreground(self, entry_id):
         """Open the given item in Outlook and bring Outlook to front."""
@@ -374,28 +392,71 @@ class MailPulseApp:
     def _show_breakdown_window(self):
         # Lightweight Tkinter popup so we avoid pulling in a heavier GUI dep.
         import tkinter as tk
+        from tkinter import ttk
 
         root = tk.Tk()
         root.title(f"{APP_NAME} - Account Breakdown")
         root.attributes("-topmost", True)
-        root.resizable(False, False)
+        root.geometry("480x420")
 
-        tk.Label(root, text="Unread by Account", font=("Segoe UI", 12, "bold")).pack(
-            padx=16, pady=(12, 6)
-        )
+        header = tk.Label(root, text="Unread by Account", font=("Segoe UI", 12, "bold"))
+        header.pack(padx=16, pady=(12, 6), anchor="w")
 
         if not self._last_snapshot:
             tk.Label(root, text="No data yet -- click 'Check Mail Now'.").pack(padx=16, pady=8)
-        else:
-            for name, count in sorted(self._last_snapshot.items()):
-                tk.Label(root, text=f"{name}: {count}", font=("Segoe UI", 10)).pack(
-                    anchor="w", padx=16
-                )
-            total = sum(self._last_snapshot.values())
-            tk.Label(root, text=f"\nTotal: {total}", font=("Segoe UI", 10, "bold")).pack(
-                anchor="w", padx=16, pady=(4, 12)
-            )
+            tk.Button(root, text="Close", command=root.destroy).pack(pady=(0, 12))
+            root.mainloop()
+            return
 
+        # Scrollable list area, since a busy inbox can have many unread items.
+        container = tk.Frame(root)
+        container.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        canvas = tk.Canvas(container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas)
+
+        scroll_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for name, status in sorted(self._last_snapshot.items()):
+            account_label = tk.Label(
+                scroll_frame,
+                text=f"{name}  ({status.unread} unread)",
+                font=("Segoe UI", 10, "bold"),
+                anchor="w",
+            )
+            account_label.pack(fill="x", pady=(10, 2))
+
+            if not status.messages:
+                tk.Label(scroll_frame, text="  (no unread mail)", fg="gray").pack(
+                    anchor="w"
+                )
+            for msg in status.messages:
+                row = tk.Frame(scroll_frame)
+                row.pack(fill="x", pady=1)
+                tk.Label(
+                    row, text=f"  {msg.received}", font=("Segoe UI", 8), fg="gray", width=14, anchor="w"
+                ).pack(side="left")
+                tk.Label(
+                    row,
+                    text=f"{msg.sender} — {msg.subject}",
+                    font=("Segoe UI", 9),
+                    anchor="w",
+                    wraplength=320,
+                    justify="left",
+                ).pack(side="left", fill="x", expand=True)
+
+        total = sum(status.unread for status in self._last_snapshot.values())
+        tk.Label(root, text=f"Total: {total}", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=16, pady=(0, 4)
+        )
         tk.Button(root, text="Close", command=root.destroy).pack(pady=(0, 12))
         root.mainloop()
 
