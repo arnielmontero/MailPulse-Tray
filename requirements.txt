@@ -1,0 +1,6 @@
+pywin32
+pystray
+Pillow
+psutil
+windows-toasts
+pyinstaller
