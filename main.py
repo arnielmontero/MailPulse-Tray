@@ -353,6 +353,7 @@ class MailPulseApp:
         )
         self._stop_event = threading.Event()
         self._last_snapshot = {}
+        self._breakdown_window = None  # set while the breakdown popup is open
 
     # -- background polling loop -----------------------------------------
 
@@ -387,14 +388,18 @@ class MailPulseApp:
         threading.Thread(target=self._do_poll, daemon=True).start()
 
     def _on_account_breakdown(self, icon, item):
-        threading.Thread(target=self._show_breakdown_window, daemon=True).start()
+        # Only one breakdown window at a time; Tkinter must run its own
+        # mainloop on a dedicated thread since pystray owns the main thread.
+        if self._breakdown_window is not None:
+            return
+        threading.Thread(target=self._run_breakdown_window, daemon=True).start()
 
-    def _show_breakdown_window(self):
-        # Lightweight Tkinter popup so we avoid pulling in a heavier GUI dep.
+    def _run_breakdown_window(self):
         import tkinter as tk
         from tkinter import ttk
 
         root = tk.Tk()
+        self._breakdown_window = root
         root.title(f"{APP_NAME} - Account Breakdown")
         root.attributes("-topmost", True)
         root.geometry("480x420")
@@ -402,13 +407,6 @@ class MailPulseApp:
         header = tk.Label(root, text="Unread by Account", font=("Segoe UI", 12, "bold"))
         header.pack(padx=16, pady=(12, 6), anchor="w")
 
-        if not self._last_snapshot:
-            tk.Label(root, text="No data yet -- click 'Check Mail Now'.").pack(padx=16, pady=8)
-            tk.Button(root, text="Close", command=root.destroy).pack(pady=(0, 12))
-            root.mainloop()
-            return
-
-        # Scrollable list area, since a busy inbox can have many unread items.
         container = tk.Frame(root)
         container.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
@@ -425,39 +423,72 @@ class MailPulseApp:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        for name, status in sorted(self._last_snapshot.items()):
-            account_label = tk.Label(
-                scroll_frame,
-                text=f"{name}  ({status.unread} unread)",
-                font=("Segoe UI", 10, "bold"),
-                anchor="w",
-            )
-            account_label.pack(fill="x", pady=(10, 2))
+        total_label = tk.Label(root, text="", font=("Segoe UI", 10, "bold"))
+        total_label.pack(anchor="w", padx=16, pady=(0, 4))
 
-            if not status.messages:
-                tk.Label(scroll_frame, text="  (no unread mail)", fg="gray").pack(
-                    anchor="w"
+        def on_close():
+            self._breakdown_window = None
+            root.destroy()
+
+        tk.Button(root, text="Close", command=on_close).pack(pady=(0, 12))
+        root.protocol("WM_DELETE_WINDOW", on_close)
+
+        def render():
+            for child in scroll_frame.winfo_children():
+                child.destroy()
+
+            if not self._last_snapshot:
+                tk.Label(scroll_frame, text="No data yet -- click 'Check Mail Now'.").pack(
+                    anchor="w", pady=8
                 )
-            for msg in status.messages:
-                row = tk.Frame(scroll_frame)
-                row.pack(fill="x", pady=1)
-                tk.Label(
-                    row, text=f"  {msg.received}", font=("Segoe UI", 8), fg="gray", width=14, anchor="w"
-                ).pack(side="left")
-                tk.Label(
-                    row,
-                    text=f"{msg.sender} — {msg.subject}",
-                    font=("Segoe UI", 9),
-                    anchor="w",
-                    wraplength=320,
-                    justify="left",
-                ).pack(side="left", fill="x", expand=True)
+                total_label.config(text="")
+                return
 
-        total = sum(status.unread for status in self._last_snapshot.values())
-        tk.Label(root, text=f"Total: {total}", font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", padx=16, pady=(0, 4)
-        )
-        tk.Button(root, text="Close", command=root.destroy).pack(pady=(0, 12))
+            for name, status in sorted(self._last_snapshot.items()):
+                account_label = tk.Label(
+                    scroll_frame,
+                    text=f"{name}  ({status.unread} unread)",
+                    font=("Segoe UI", 10, "bold"),
+                    anchor="w",
+                )
+                account_label.pack(fill="x", pady=(10, 2))
+
+                if not status.messages:
+                    tk.Label(scroll_frame, text="  (no unread mail)", fg="gray").pack(
+                        anchor="w"
+                    )
+                for msg in status.messages:
+                    row = tk.Frame(scroll_frame)
+                    row.pack(fill="x", pady=1)
+                    tk.Label(
+                        row,
+                        text=f"  {msg.received}",
+                        font=("Segoe UI", 8),
+                        fg="gray",
+                        width=14,
+                        anchor="w",
+                    ).pack(side="left")
+                    tk.Label(
+                        row,
+                        text=f"{msg.sender} — {msg.subject}",
+                        font=("Segoe UI", 9),
+                        anchor="w",
+                        wraplength=320,
+                        justify="left",
+                    ).pack(side="left", fill="x", expand=True)
+
+            total = sum(status.unread for status in self._last_snapshot.values())
+            total_label.config(text=f"Total: {total}")
+
+        def auto_refresh():
+            if self._breakdown_window is None:
+                return  # window was closed
+            render()
+            # Re-check slightly more often than the poll interval so the
+            # popup picks up each new result promptly after it lands.
+            root.after(2000, auto_refresh)
+
+        auto_refresh()
         root.mainloop()
 
     def _on_exit(self, icon, item):
