@@ -20,8 +20,12 @@ Architecture
   notification with Account / Sender / Subject. Clicking the toast
   launches/focuses Outlook Classic and opens that exact email by matching
   its Message-ID header against Outlook's PR_INTERNET_MESSAGE_ID property.
-- Account credentials live in a local config.json (plaintext, per user
-  request) next to the executable/script.
+- Account credentials are managed through a Settings window (Tray menu ->
+  Settings), never by hand-editing a file. Server/email/port metadata is
+  stored in a local accounts.json next to the executable/script; the
+  password itself is stored securely in Windows Credential Manager via
+  the `keyring` package, keyed by account email, so it never sits in
+  plaintext on disk.
 
 This file is single-file and dependency-light so it can be frozen into a
 single .exe with PyInstaller. See README.md for packaging steps.
@@ -35,8 +39,10 @@ import os
 import sys
 import threading
 import traceback
+import uuid
 from dataclasses import dataclass, field
 
+import keyring
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 
@@ -68,56 +74,101 @@ except ImportError:
 
 APP_NAME = "MailPulse Tray"
 POLL_INTERVAL_SECONDS = 20
-CONFIG_FILENAME = "config.json"
+ACCOUNTS_FILENAME = "accounts.json"
+KEYRING_SERVICE = "MailPulseTray"
 
 
 def _base_dir():
-    """Directory the .exe (or script) lives in, so config.json sits next
+    """Directory the .exe (or script) lives in, so accounts.json sits next
     to it whether running from source or as a frozen PyInstaller build."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
-CONFIG_PATH = os.path.join(_base_dir(), CONFIG_FILENAME)
+ACCOUNTS_PATH = os.path.join(_base_dir(), ACCOUNTS_FILENAME)
 
 
 # ------------------------------------------------------------------------
-# Config
+# Account store -- metadata in accounts.json, password in Windows
+# Credential Manager (via keyring), never written to disk in plaintext.
 # ------------------------------------------------------------------------
 
 @dataclass
 class AccountConfig:
+    id: str
     name: str
     imap_server: str
     imap_port: int
     email: str
-    password: str
     mailbox: str = "INBOX"
     use_ssl: bool = True
 
+    @property
+    def password(self) -> str:
+        return keyring.get_password(KEYRING_SERVICE, self.id) or ""
 
-def load_accounts():
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(
-            f"config.json not found at {CONFIG_PATH}. See config.example.json "
-            "for the expected format."
-        )
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        raw = json.load(f)
 
-    accounts = []
-    for entry in raw.get("accounts", []):
-        accounts.append(AccountConfig(
-            name=entry.get("name") or entry["email"],
-            imap_server=entry["imap_server"],
-            imap_port=int(entry.get("imap_port", 993)),
-            email=entry["email"],
-            password=entry["password"],
-            mailbox=entry.get("mailbox", "INBOX"),
-            use_ssl=bool(entry.get("use_ssl", True)),
-        ))
-    return accounts
+class AccountStore:
+    """Reads/writes accounts.json (non-secret metadata) and delegates
+    password storage/retrieval to Windows Credential Manager."""
+
+    def __init__(self, path=ACCOUNTS_PATH):
+        self.path = path
+
+    def load(self):
+        if not os.path.exists(self.path):
+            return []
+        with open(self.path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        accounts = []
+        for entry in raw.get("accounts", []):
+            accounts.append(AccountConfig(
+                id=entry["id"],
+                name=entry.get("name") or entry["email"],
+                imap_server=entry["imap_server"],
+                imap_port=int(entry.get("imap_port", 993)),
+                email=entry["email"],
+                mailbox=entry.get("mailbox", "INBOX"),
+                use_ssl=bool(entry.get("use_ssl", True)),
+            ))
+        return accounts
+
+    def save(self, accounts):
+        raw = {"accounts": [
+            {
+                "id": a.id,
+                "name": a.name,
+                "imap_server": a.imap_server,
+                "imap_port": a.imap_port,
+                "email": a.email,
+                "mailbox": a.mailbox,
+                "use_ssl": a.use_ssl,
+            }
+            for a in accounts
+        ]}
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(raw, f, indent=2)
+
+    def add_or_update(self, accounts, account: AccountConfig, password: str):
+        """Insert/replace `account` in `accounts` (matched by id), persist
+        metadata to disk, and store its password in Credential Manager.
+        Returns the updated list."""
+        keyring.set_password(KEYRING_SERVICE, account.id, password)
+        updated = [a for a in accounts if a.id != account.id]
+        updated.append(account)
+        self.save(updated)
+        return updated
+
+    def remove(self, accounts, account_id: str):
+        try:
+            keyring.delete_password(KEYRING_SERVICE, account_id)
+        except keyring.errors.PasswordDeleteError:
+            pass
+        updated = [a for a in accounts if a.id != account_id]
+        self.save(updated)
+        return updated
 
 
 # ------------------------------------------------------------------------
@@ -153,6 +204,10 @@ class ImapMonitor:
         self.accounts = accounts
         self.status = {}  # name -> AccountStatus
         self._lock = threading.Lock()
+
+    def set_accounts(self, accounts):
+        with self._lock:
+            self.accounts = accounts
 
     def poll(self):
         """Check every account for unread mail. Returns:
@@ -426,8 +481,10 @@ class Notifier:
 # ------------------------------------------------------------------------
 
 class MailPulseApp:
-    def __init__(self, accounts):
-        self.monitor = ImapMonitor(accounts)
+    def __init__(self, account_store: AccountStore):
+        self.account_store = account_store
+        self.accounts = account_store.load()
+        self.monitor = ImapMonitor(self.accounts)
         self.outlook_launcher = OutlookLauncher() if _OUTLOOK_COM_AVAILABLE else None
         self.notifier = Notifier(on_click=self._handle_notification_click)
 
@@ -437,6 +494,7 @@ class MailPulseApp:
         self.icon.menu = pystray.Menu(
             pystray.MenuItem("Check Mail Now", self._on_check_now),
             pystray.MenuItem("Account Breakdown", self._on_account_breakdown),
+            pystray.MenuItem("Settings", self._on_settings),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", self._on_exit),
         )
@@ -444,6 +502,7 @@ class MailPulseApp:
         self._stop_event = threading.Event()
         self._last_snapshot = {}
         self._breakdown_window = None
+        self._settings_window = None
 
     # -- background polling loop -----------------------------------------
 
@@ -573,6 +632,172 @@ class MailPulseApp:
         auto_refresh()
         root.mainloop()
 
+    def _on_settings(self, icon, item):
+        if self._settings_window is not None:
+            return
+        threading.Thread(target=self._run_settings_window, daemon=True).start()
+
+    def _run_settings_window(self):
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+
+        root = tk.Tk()
+        self._settings_window = root
+        root.title(f"{APP_NAME} - Settings")
+        root.attributes("-topmost", True)
+        root.geometry("560x380")
+
+        tk.Label(root, text="Email Accounts", font=("Segoe UI", 12, "bold")).pack(
+            padx=16, pady=(12, 6), anchor="w"
+        )
+
+        list_frame = tk.Frame(root)
+        list_frame.pack(fill="both", expand=True, padx=16)
+
+        columns = ("name", "email", "server")
+        tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=8)
+        tree.heading("name", text="Account Name")
+        tree.heading("email", text="Email")
+        tree.heading("server", text="IMAP Server")
+        tree.column("name", width=140)
+        tree.column("email", width=180)
+        tree.column("server", width=180)
+        tree.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+
+        def refresh_list():
+            tree.delete(*tree.get_children())
+            for account in self.accounts:
+                tree.insert("", "end", iid=account.id,
+                            values=(account.name, account.email, account.imap_server))
+
+        refresh_list()
+
+        button_row = tk.Frame(root)
+        button_row.pack(fill="x", padx=16, pady=10)
+
+        def on_add():
+            self._open_account_editor(root, refresh_list, account=None)
+
+        def on_edit():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showinfo(APP_NAME, "Select an account to edit.", parent=root)
+                return
+            account = next((a for a in self.accounts if a.id == selection[0]), None)
+            if account:
+                self._open_account_editor(root, refresh_list, account=account)
+
+        def on_delete():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showinfo(APP_NAME, "Select an account to delete.", parent=root)
+                return
+            account_id = selection[0]
+            account = next((a for a in self.accounts if a.id == account_id), None)
+            if account and messagebox.askyesno(
+                APP_NAME, f"Remove account '{account.name}'?", parent=root
+            ):
+                self.accounts = self.account_store.remove(self.accounts, account_id)
+                self.monitor.set_accounts(self.accounts)
+                refresh_list()
+
+        tk.Button(button_row, text="Add Account", command=on_add).pack(side="left")
+        tk.Button(button_row, text="Edit", command=on_edit).pack(side="left", padx=(8, 0))
+        tk.Button(button_row, text="Delete", command=on_delete).pack(side="left", padx=(8, 0))
+        tk.Button(button_row, text="Close", command=root.destroy).pack(side="right")
+
+        def on_close():
+            self._settings_window = None
+            root.destroy()
+
+        root.protocol("WM_DELETE_WINDOW", on_close)
+        root.mainloop()
+
+    def _open_account_editor(self, parent, on_saved, account):
+        """Modal dialog to add or edit a single account's fields, including
+        its password (stored via keyring, never written to accounts.json)."""
+        import tkinter as tk
+        from tkinter import messagebox
+
+        dialog = tk.Toplevel(parent)
+        dialog.title("Add Account" if account is None else "Edit Account")
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        fields = {}
+
+        def add_field(label_text, initial="", show=None):
+            row = tk.Frame(dialog)
+            row.pack(fill="x", padx=16, pady=6)
+            tk.Label(row, text=label_text, width=14, anchor="w").pack(side="left")
+            var = tk.StringVar(value=initial)
+            entry = tk.Entry(row, textvariable=var, width=32, show=show or "")
+            entry.pack(side="left", fill="x", expand=True)
+            fields[label_text] = var
+            return var
+
+        add_field("Account Name", account.name if account else "")
+        add_field("Email", account.email if account else "")
+        add_field("IMAP Server", account.imap_server if account else "")
+        add_field("IMAP Port", str(account.imap_port) if account else "993")
+        add_field("Mailbox", account.mailbox if account else "INBOX")
+        password_var = add_field(
+            "Password", account.password if account else "", show="*"
+        )
+
+        use_ssl_var = tk.BooleanVar(value=account.use_ssl if account else True)
+        ssl_row = tk.Frame(dialog)
+        ssl_row.pack(fill="x", padx=16, pady=6)
+        tk.Label(ssl_row, text="Use SSL", width=14, anchor="w").pack(side="left")
+        tk.Checkbutton(ssl_row, variable=use_ssl_var).pack(side="left")
+
+        def on_save():
+            name = fields["Account Name"].get().strip()
+            email_addr = fields["Email"].get().strip()
+            server = fields["IMAP Server"].get().strip()
+            port_str = fields["IMAP Port"].get().strip()
+            mailbox = fields["Mailbox"].get().strip() or "INBOX"
+            password = password_var.get()
+
+            if not email_addr or not server or not port_str:
+                messagebox.showerror(
+                    APP_NAME, "Email, IMAP Server, and IMAP Port are required.", parent=dialog
+                )
+                return
+            try:
+                port = int(port_str)
+            except ValueError:
+                messagebox.showerror(APP_NAME, "IMAP Port must be a number.", parent=dialog)
+                return
+
+            new_account = AccountConfig(
+                id=account.id if account else str(uuid.uuid4()),
+                name=name or email_addr,
+                imap_server=server,
+                imap_port=port,
+                email=email_addr,
+                mailbox=mailbox,
+                use_ssl=use_ssl_var.get(),
+            )
+            self.accounts = self.account_store.add_or_update(
+                self.accounts, new_account, password
+            )
+            self.monitor.set_accounts(self.accounts)
+            on_saved()
+            dialog.destroy()
+
+        button_row = tk.Frame(dialog)
+        button_row.pack(fill="x", padx=16, pady=(10, 16))
+        tk.Button(button_row, text="Save", command=on_save).pack(side="right")
+        tk.Button(button_row, text="Cancel", command=dialog.destroy).pack(
+            side="right", padx=(0, 8)
+        )
+
     def _on_exit(self, icon, item):
         self._stop_event.set()
         icon.stop()
@@ -598,17 +823,11 @@ def main():
         print("MailPulse Tray requires Windows.")
         sys.exit(1)
 
-    try:
-        accounts = load_accounts()
-    except Exception as exc:
-        print(f"Failed to load {CONFIG_PATH}: {exc}")
-        sys.exit(1)
-
-    if not accounts:
-        print("No accounts configured in config.json.")
-        sys.exit(1)
-
-    app = MailPulseApp(accounts)
+    app = MailPulseApp(AccountStore())
+    if not app.accounts:
+        # First run / no accounts configured yet -- open Settings so the
+        # user can add an account instead of hand-editing a file.
+        threading.Thread(target=app._run_settings_window, daemon=True).start()
     app.run()
 
 

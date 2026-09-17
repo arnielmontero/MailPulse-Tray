@@ -34,38 +34,31 @@ pip install -r requirements.txt
 ```
 
 This installs `pywin32`, `pystray`, `Pillow`, `psutil`, `windows-toasts`,
-and `pyinstaller`. `pywin32`/`psutil` are only used for the Outlook
-deep-link feature — IMAP fetching itself uses only the Python standard
-library (`imaplib`, `email`).
+`keyring`, and `pyinstaller`. `pywin32`/`psutil` are only used for the
+Outlook deep-link feature — IMAP fetching itself uses only the Python
+standard library (`imaplib`, `email`).
 
-## 2. Configure accounts
+## 2. Configure accounts (via the Settings window — no file editing)
 
-Copy `config.example.json` to `config.json` (same folder as `main.py`, or
-next to the compiled `.exe`) and fill in your real cPanel IMAP credentials:
+Accounts are added entirely through the app's UI:
 
-```json
-{
-  "accounts": [
-    {
-      "name": "Support Inbox",
-      "imap_server": "mail.example-cpanel-host.com",
-      "imap_port": 993,
-      "use_ssl": true,
-      "email": "support@example.com",
-      "password": "your-password-here",
-      "mailbox": "INBOX"
-    }
-  ]
-}
-```
+1. Run `python main.py` (or the compiled `.exe`). On first run with no
+   accounts configured, the **Settings** window opens automatically.
+2. Click **Add Account** and fill in: Account Name, Email, IMAP Server,
+   IMAP Port (993 for SSL), Mailbox (defaults to `INBOX`), Use SSL, and
+   Password.
+3. Click **Save**. You can add as many accounts as you like, and later
+   reopen Settings any time from the tray menu (right-click the tray
+   icon → **Settings**) to add, edit, or delete accounts.
 
-Add one object per account. `mailbox` defaults to `INBOX` if omitted.
-
-> **Security note:** passwords are stored in plaintext in `config.json` by
-> design (per project requirements) for simplicity. Keep this file private
-> — it is already excluded via `.gitignore` and must never be committed or
-> shared. If you'd prefer OS-level credential storage instead, this can be
-> swapped for Windows Credential Manager (via the `keyring` package) later.
+**Where credentials actually live:**
+- Server/email/port/mailbox metadata is stored in `accounts.json`, next to
+  `main.py` or the compiled `.exe`. No passwords are written to this file.
+- Each account's password is stored securely in **Windows Credential
+  Manager**, via the `keyring` package, keyed by an internal account ID.
+  You can inspect these entries yourself in Windows' *Credential Manager*
+  control panel under "Generic Credentials" (look for entries prefixed
+  `MailPulseTray`).
 
 ## 3. Run from source (optional, for testing)
 
@@ -85,7 +78,9 @@ pyinstaller --noconsole --onefile --name MailPulseTray ^
   --hidden-import=win32com.client ^
   --hidden-import=pythoncom ^
   --hidden-import=pywintypes ^
+  --hidden-import=keyring.backends.Windows ^
   --collect-submodules win32com ^
+  --collect-submodules keyring ^
   main.py
 ```
 
@@ -95,8 +90,9 @@ Or just run `build.bat` from the project directory.
   app).
 - `--onefile` — bundles everything into a single portable `.exe`.
 - The `--hidden-import` / `--collect-submodules` flags are required
-  because `pythoncom` / `pywintypes` are compiled DLL-backed modules that
-  PyInstaller's static analysis misses by default.
+  because `pythoncom` / `pywintypes` are compiled DLL-backed modules, and
+  `keyring`'s Windows backend is resolved via entry points at runtime —
+  both are missed by PyInstaller's static analysis by default.
 
 The compiled executable is created at:
 
@@ -104,15 +100,18 @@ The compiled executable is created at:
 dist\MailPulseTray.exe
 ```
 
-**Important:** copy your real `config.json` into the `dist\` folder next
-to `MailPulseTray.exe` — the compiled app looks for `config.json` in the
-same directory it runs from.
+**Note:** `accounts.json` is created automatically the first time you save
+an account through the Settings window — there is nothing to copy in
+manually. If you move the `.exe` to a new machine/folder, you'll need to
+re-add accounts there (Credential Manager entries and `accounts.json` are
+both local to the machine/user profile they were created on).
 
 ## 5. Run automatically at Windows startup
 
 1. Press `Win + R`, type `shell:startup`, press Enter.
-2. Copy `dist\MailPulseTray.exe` and `dist\config.json` to a permanent
-   folder (e.g. `C:\Tools\MailPulseTray\`).
+2. Copy `dist\MailPulseTray.exe` to a permanent folder (e.g.
+   `C:\Tools\MailPulseTray\`) — `accounts.json` will be created there
+   automatically the first time you add an account.
 3. In the Startup folder, right-click and **Paste shortcut** pointing at
    the `.exe` in that permanent folder.
 4. Log off and back on (or reboot) to confirm it launches silently in the

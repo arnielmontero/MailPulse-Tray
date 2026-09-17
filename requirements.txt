@@ -3,4 +3,5 @@ pystray
 Pillow
 psutil
 windows-toasts
+keyring
 pyinstaller
