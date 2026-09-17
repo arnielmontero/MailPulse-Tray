@@ -1,47 +1,82 @@
 # MailPulse Tray
 
-A zero-config Windows system tray utility that tracks unread mail across all
-accounts logged into Outlook Classic (desktop), via MAPI/COM automation.
+A Windows system tray utility that tracks unread mail across multiple
+cPanel (or any IMAP) accounts by connecting **directly over IMAP** —
+independent of whether Outlook Classic is running. Outlook Classic is used
+only for one thing: opening the exact email when you click a notification.
+
+## Architecture
+
+- **IMAP is the source of truth.** Every 20 seconds the app connects
+  directly to each configured account over IMAP SSL (port 993) and checks
+  `UNSEEN` message counts. This works even if Outlook is fully closed.
+- **Read-state sync is automatic.** When you read an email in Outlook,
+  Outlook marks it `SEEN` on the IMAP server. The next IMAP poll sees the
+  lower `UNSEEN` count automatically — no separate sync logic needed.
+- **Outlook COM is only used for deep-linking.** When you click a toast
+  notification, the app launches/focuses Outlook Classic and opens that
+  exact email by matching its `Message-ID` header against Outlook's
+  `PR_INTERNET_MESSAGE_ID` property (falls back to a Subject search if the
+  message hasn't synced into Outlook yet).
 
 ## Requirements
 
 - Windows 10/11
-- Outlook Classic (desktop) installed and configured with one or more
-  accounts (cPanel/IMAP/Exchange, etc.) — it must be running (or launchable)
-  for MAPI automation to work.
-- Python 3.9+ (only needed to run from source / build the .exe; end users
-  just run the compiled `.exe`).
+- Python 3.9+ (only needed to run from source / build the .exe)
+- cPanel (or any IMAP-accessible) email account credentials
+- Outlook Classic installed, for the click-to-open deep-link feature only
+  (not required for mail checking/notifications to work)
 
 ## 1. Install dependencies
-
-```bash
-pip install pywin32 pystray Pillow psutil windows-toasts pyinstaller
-```
-
-> `windows-toasts` is preferred for click-to-open notification support. If
-> it fails to install on your system, you can substitute `win10toast`
-> instead — the script auto-detects whichever is present, but note
-> `win10toast` does not support click callbacks reliably.
-
-Or simply:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 2. Run from source (optional, for testing)
+This installs `pywin32`, `pystray`, `Pillow`, `psutil`, `windows-toasts`,
+and `pyinstaller`. `pywin32`/`psutil` are only used for the Outlook
+deep-link feature — IMAP fetching itself uses only the Python standard
+library (`imaplib`, `email`).
+
+## 2. Configure accounts
+
+Copy `config.example.json` to `config.json` (same folder as `main.py`, or
+next to the compiled `.exe`) and fill in your real cPanel IMAP credentials:
+
+```json
+{
+  "accounts": [
+    {
+      "name": "Support Inbox",
+      "imap_server": "mail.example-cpanel-host.com",
+      "imap_port": 993,
+      "use_ssl": true,
+      "email": "support@example.com",
+      "password": "your-password-here",
+      "mailbox": "INBOX"
+    }
+  ]
+}
+```
+
+Add one object per account. `mailbox` defaults to `INBOX` if omitted.
+
+> **Security note:** passwords are stored in plaintext in `config.json` by
+> design (per project requirements) for simplicity. Keep this file private
+> — it is already excluded via `.gitignore` and must never be committed or
+> shared. If you'd prefer OS-level credential storage instead, this can be
+> swapped for Windows Credential Manager (via the `keyring` package) later.
+
+## 3. Run from source (optional, for testing)
 
 ```bash
 python main.py
 ```
 
-Outlook must already be open (or will be launched by COM automation on
-first call). The tray icon will appear in the system tray within ~20
-seconds showing the current unread badge.
+The tray icon appears within a few seconds showing the unread badge across
+all configured accounts, refreshed every 20 seconds.
 
-## 3. Build the standalone .exe
-
-From the project directory, run:
+## 4. Build the standalone .exe
 
 ```bash
 pyinstaller --noconsole --onefile --name MailPulseTray ^
@@ -56,51 +91,51 @@ pyinstaller --noconsole --onefile --name MailPulseTray ^
 
 Or just run `build.bat` from the project directory.
 
-- `--noconsole` — suppresses the terminal/console window (this is a
-  background tray app).
+- `--noconsole` — suppresses the terminal/console window (background tray
+  app).
 - `--onefile` — bundles everything into a single portable `.exe`.
-- The `--hidden-import` / `--collect-submodules` flags are required because
-  `pythoncom` / `pywintypes` are compiled DLL-backed modules that
-  PyInstaller's static analysis misses by default, causing
-  `ModuleNotFoundError: No module named 'pythoncom'` at runtime otherwise.
-- Add `--icon=app_icon.ico` if you have a custom `.ico` file to brand the
-  built executable and its taskbar entry. (The in-tray badge icon is
-  generated dynamically at runtime regardless of this flag.)
+- The `--hidden-import` / `--collect-submodules` flags are required
+  because `pythoncom` / `pywintypes` are compiled DLL-backed modules that
+  PyInstaller's static analysis misses by default.
 
-The compiled executable will be created at:
+The compiled executable is created at:
 
 ```
 dist\MailPulseTray.exe
 ```
 
-## 4. Run automatically at Windows startup
+**Important:** copy your real `config.json` into the `dist\` folder next
+to `MailPulseTray.exe` — the compiled app looks for `config.json` in the
+same directory it runs from.
 
-1. Press `Win + R`, type `shell:startup`, press Enter. This opens your
-   personal Windows Startup folder.
-2. Copy `dist\MailPulseTray.exe`, right-click inside the Startup folder,
-   and choose **Paste shortcut** (recommended over pasting the raw .exe,
-   so you can rename/move the original later without breaking startup).
-3. Log off and back on (or reboot) to confirm it launches silently in the
+## 5. Run automatically at Windows startup
+
+1. Press `Win + R`, type `shell:startup`, press Enter.
+2. Copy `dist\MailPulseTray.exe` and `dist\config.json` to a permanent
+   folder (e.g. `C:\Tools\MailPulseTray\`).
+3. In the Startup folder, right-click and **Paste shortcut** pointing at
+   the `.exe` in that permanent folder.
+4. Log off and back on (or reboot) to confirm it launches silently in the
    tray.
 
 To stop it from auto-running, delete the shortcut from the Startup folder.
 
 ## How it works
 
-- On each poll cycle (every 20 seconds), the app connects to the running
-  Outlook session via `win32com.client.Dispatch("Outlook.Application")`
-  and walks `namespace.Stores` — this automatically picks up every account
-  configured in Outlook (cPanel/IMAP, POP, Exchange, etc.) with zero
-  manual configuration.
-- For each store, it recursively walks all folders and sums
-  `folder.UnReadItemCount`, so mail filed into subfolders by rules is
-  still counted.
-- It tracks the set of unread item EntryIDs per account between polls to
-  detect genuinely *new* unread mail (vs. a count that simply changed) and
-  fires a toast notification with the account name, sender, and subject
-  only for those new items.
-- Because the badge is always recomputed from Outlook's live
-  `UnReadItemCount`, marking an email as read inside Outlook is reflected
-  automatically on the very next poll — no separate sync logic required.
-- Clicking a notification calls `item.Display()` on that exact mail item
-  and brings the Outlook window to the foreground.
+- `ImapMonitor.poll()` connects to each account with `imaplib.IMAP4_SSL`,
+  logs in, selects the mailbox read-only, and runs `SEARCH UNSEEN`. Only
+  headers (`From`, `Subject`, `Date`, `Message-ID`) are fetched — not full
+  message bodies — so polling stays fast even with a busy inbox.
+- New-mail detection compares the set of UNSEEN UIDs against the previous
+  poll's set; only genuinely new UIDs trigger a toast notification
+  (the very first poll never fires notifications, to avoid a startup
+  storm for pre-existing unread mail).
+- Clicking a notification calls `OutlookLauncher.open_by_message_id()`,
+  which launches Outlook via `win32com.client.Dispatch` if it isn't
+  running, searches Inbox items across all Outlook stores for a matching
+  `PR_INTERNET_MESSAGE_ID`, and calls `item.Display()` on it — falling
+  back to a Subject-based search if no Message-ID match is found.
+- Because IMAP is the only thing polled for counts, the tray badge, the
+  Account Breakdown popup, and notifications all work whether or not
+  Outlook is open. Outlook is only launched on-demand, only when you
+  click a notification.

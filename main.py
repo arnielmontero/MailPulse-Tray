@@ -1,48 +1,59 @@
 """
 MailPulse Tray
 ===============
-A lightweight, zero-config Windows System Tray utility that tracks unread
-emails across every account configured in a running Outlook Classic (desktop)
-session, using MAPI/COM automation via pywin32.
+A lightweight Windows System Tray utility that tracks unread emails across
+multiple cPanel (or any IMAP) accounts by connecting DIRECTLY over IMAP,
+independent of whether Outlook Classic is running. Outlook Classic (via
+win32com/MAPI) is used only for one thing: deep-linking -- opening the
+exact email in Outlook when you click a notification.
 
-Features
---------
-- Zero-config: attaches to the already-running Outlook session and walks
-  outlook.Stores to discover every configured account/mailbox automatically.
-- System tray icon with a live badge showing total unread count across all
-  accounts (pystray + Pillow, icon regenerated on every refresh).
-- Tray menu: "Check Mail Now", "Account Breakdown", "Exit".
-- Desktop toast notifications on new mail (windows-toasts, falling back to
-  win10toast if unavailable) showing Account / Sender / Subject. Clicking a
-  notification brings Outlook to the foreground and opens that exact email.
-- Polls every 20 seconds. Because it always asks Outlook for the live
-  UnReadItemCount, reading a message in Outlook is reflected automatically
-  on the very next cycle -- no separate "sync" logic is needed.
+Architecture
+------------
+- IMAP (imaplib, SSL port 993) is the source of truth for unread counts.
+  This means the tray badge updates even when Outlook is completely closed.
+- Every poll cycle (15-30s) each configured account is checked for UNSEEN
+  messages. Because Outlook marks a message SEEN on the IMAP server the
+  moment you read it there, the next poll automatically sees the lower
+  UNSEEN count -- no separate "sync" logic needed, IMAP already reflects
+  Outlook's read state.
+- New UNSEEN messages (not seen on the previous poll) trigger a toast
+  notification with Account / Sender / Subject. Clicking the toast
+  launches/focuses Outlook Classic and opens that exact email by matching
+  its Message-ID header against Outlook's PR_INTERNET_MESSAGE_ID property.
+- Account credentials live in a local config.json (plaintext, per user
+  request) next to the executable/script.
 
-This file is intentionally single-file and dependency-light so it can be
-frozen into a single .exe with PyInstaller. See the accompanying README /
-build instructions for packaging steps.
+This file is single-file and dependency-light so it can be frozen into a
+single .exe with PyInstaller. See README.md for packaging steps.
 """
 
+import imaplib
+import email
+import email.utils
+import json
+import os
 import sys
 import threading
-import time
 import traceback
 from dataclasses import dataclass, field
 
-import pythoncom
-import pywintypes
-import win32com.client
-import win32gui
-import win32con
-import win32process
-import psutil  # only used to best-effort find/foreground the Outlook window
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 
+# --- Outlook COM (deep-linking only; imported lazily/defensively so the
+# IMAP fetching path works even if pywin32/Outlook isn't available) -------
+try:
+    import pythoncom
+    import win32com.client
+    import win32gui
+    import win32con
+    import win32process
+    import psutil
+    _OUTLOOK_COM_AVAILABLE = True
+except ImportError:
+    _OUTLOOK_COM_AVAILABLE = False
+
 # --- Notifications -----------------------------------------------------
-# Prefer windows-toasts (modern, supports click callbacks cleanly). Fall
-# back to win10toast if it isn't installed.
 _NOTIFY_BACKEND = None
 try:
     from windows_toasts import WindowsToaster, Toast, ToastActivatedEventArgs
@@ -55,8 +66,58 @@ except ImportError:
         _NOTIFY_BACKEND = None
 
 
-POLL_INTERVAL_SECONDS = 20
 APP_NAME = "MailPulse Tray"
+POLL_INTERVAL_SECONDS = 20
+CONFIG_FILENAME = "config.json"
+
+
+def _base_dir():
+    """Directory the .exe (or script) lives in, so config.json sits next
+    to it whether running from source or as a frozen PyInstaller build."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_PATH = os.path.join(_base_dir(), CONFIG_FILENAME)
+
+
+# ------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------
+
+@dataclass
+class AccountConfig:
+    name: str
+    imap_server: str
+    imap_port: int
+    email: str
+    password: str
+    mailbox: str = "INBOX"
+    use_ssl: bool = True
+
+
+def load_accounts():
+    if not os.path.exists(CONFIG_PATH):
+        raise FileNotFoundError(
+            f"config.json not found at {CONFIG_PATH}. See config.example.json "
+            "for the expected format."
+        )
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    accounts = []
+    for entry in raw.get("accounts", []):
+        accounts.append(AccountConfig(
+            name=entry.get("name") or entry["email"],
+            imap_server=entry["imap_server"],
+            imap_port=int(entry.get("imap_port", 993)),
+            email=entry["email"],
+            password=entry["password"],
+            mailbox=entry.get("mailbox", "INBOX"),
+            use_ssl=bool(entry.get("use_ssl", True)),
+        ))
+    return accounts
 
 
 # ------------------------------------------------------------------------
@@ -65,208 +126,210 @@ APP_NAME = "MailPulse Tray"
 
 @dataclass
 class UnreadMessage:
-    entry_id: str
+    uid: str
+    message_id: str
     sender: str
     subject: str
-    received: str  # pre-formatted display string
+    received: str
 
 
 @dataclass
 class AccountStatus:
     name: str
     unread: int = 0
-    # EntryID/StoreID of unread items seen last cycle, used to detect
-    # genuinely *new* unread mail (as opposed to a count that dropped).
-    seen_entry_ids: set = field(default_factory=set)
+    seen_uids: set = field(default_factory=set)
     messages: list = field(default_factory=list)
+    error: str = ""
 
 
 # ------------------------------------------------------------------------
-# Outlook / MAPI access
+# IMAP fetching -- independent of Outlook
 # ------------------------------------------------------------------------
 
-class OutlookMonitor:
-    """Wraps COM access to a running Outlook Classic session."""
+class ImapMonitor:
+    """Polls one or more IMAP accounts directly, independent of Outlook."""
+
+    def __init__(self, accounts):
+        self.accounts = accounts
+        self.status = {}  # name -> AccountStatus
+        self._lock = threading.Lock()
+
+    def poll(self):
+        """Check every account for unread mail. Returns:
+        (total_unread, dict[name -> AccountStatus], list[new_mail_events])
+
+        new_mail_events: list of dicts with account/sender/subject/message_id
+        for messages newly seen as unread since the previous poll.
+        """
+        new_events = []
+        snapshot = {}
+
+        with self._lock:
+            for account in self.accounts:
+                status = self._poll_account(account)
+                prior = self.status.get(account.name)
+                prior_uids = prior.seen_uids if prior else set()
+
+                if prior is not None:
+                    new_uids = status.seen_uids - prior_uids
+                    for msg in status.messages:
+                        if msg.uid in new_uids:
+                            new_events.append({
+                                "account": account.name,
+                                "sender": msg.sender,
+                                "subject": msg.subject,
+                                "message_id": msg.message_id,
+                            })
+
+                self.status[account.name] = status
+                snapshot[account.name] = status
+
+        total = sum(s.unread for s in snapshot.values())
+        return total, snapshot, new_events
+
+    def _poll_account(self, account: AccountConfig) -> AccountStatus:
+        try:
+            if account.use_ssl:
+                conn = imaplib.IMAP4_SSL(account.imap_server, account.imap_port)
+            else:
+                conn = imaplib.IMAP4(account.imap_server, account.imap_port)
+            try:
+                conn.login(account.email, account.password)
+                conn.select(account.mailbox, readonly=True)
+
+                typ, data = conn.search(None, "UNSEEN")
+                if typ != "OK":
+                    return AccountStatus(name=account.name, error="IMAP search failed")
+
+                uids = data[0].split()
+                messages = []
+                seen_uids = set()
+
+                # Fetch headers only (fast, no body download) for each
+                # unseen message, newest first.
+                for uid in reversed(uids):
+                    uid_str = uid.decode() if isinstance(uid, bytes) else str(uid)
+                    seen_uids.add(uid_str)
+                    try:
+                        typ, msg_data = conn.fetch(
+                            uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])"
+                        )
+                        if typ != "OK" or not msg_data or not msg_data[0]:
+                            continue
+                        header_bytes = msg_data[0][1]
+                        parsed = email.message_from_bytes(header_bytes)
+
+                        sender = email.utils.parseaddr(parsed.get("From", ""))[0] \
+                            or email.utils.parseaddr(parsed.get("From", ""))[1] \
+                            or "Unknown Sender"
+                        subject = parsed.get("Subject", "(no subject)")
+                        message_id = parsed.get("Message-ID", "").strip()
+                        date_hdr = parsed.get("Date", "")
+                        try:
+                            dt = email.utils.parsedate_to_datetime(date_hdr)
+                            received = dt.strftime("%Y-%m-%d %H:%M")
+                        except Exception:
+                            received = ""
+
+                        messages.append(UnreadMessage(
+                            uid=uid_str,
+                            message_id=message_id,
+                            sender=sender,
+                            subject=subject,
+                            received=received,
+                        ))
+                    except Exception:
+                        continue
+
+                return AccountStatus(
+                    name=account.name,
+                    unread=len(uids),
+                    seen_uids=seen_uids,
+                    messages=messages,
+                )
+            finally:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+        except Exception as exc:
+            return AccountStatus(name=account.name, error=str(exc))
+
+
+# ------------------------------------------------------------------------
+# Outlook COM deep-linking (click-to-open only)
+# ------------------------------------------------------------------------
+
+class OutlookLauncher:
+    """Used only to open a specific email in Outlook Classic when a
+    notification is clicked. Never used to check/send/receive mail."""
 
     def __init__(self):
         self.outlook = None
         self.namespace = None
-        self.accounts = {}  # store name -> AccountStatus
-        self._lock = threading.Lock()
 
-    def connect(self):
-        """Attach to the running Outlook instance via MAPI."""
+    def _connect(self):
         self.outlook = win32com.client.Dispatch("Outlook.Application")
         self.namespace = self.outlook.GetNamespace("MAPI")
 
-    def _force_send_receive(self):
-        """Actively trigger Outlook to fetch new mail from the server for
-        every account, instead of only reading whatever Outlook already
-        happens to have cached locally. Mirrors pressing Send/Receive All
-        Folders (F9) in Outlook."""
-        try:
-            self.namespace.SendAndReceive(False)  # False = don't show dialog
-        except Exception:
-            # Fall back to iterating each sync group explicitly if the
-            # simple call is unavailable for some Outlook configurations.
-            try:
-                for sync_object in self.namespace.SyncObjects:
-                    try:
-                        sync_object.Start()
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-    def _get_inbox_folder(self, store):
-        """Return the Inbox folder for a store, matching what Outlook's
-        folder-pane unread badge shows (Inbox only, not subfolders like
-        Archive/Trash/spam/rule-filed folders)."""
-        try:
-            # olFolderInbox = 6
-            return store.GetDefaultFolder(6)
-        except Exception:
-            return None
-
-    def poll(self):
-        """Refresh unread counts for every account. Returns:
-        (total_unread, dict[name -> unread], list[new_mail_events])
-
-        new_mail_events is a list of dicts: {account, sender, subject, entry_id}
-        for messages that are newly unread since the previous poll.
-        """
+    def open_by_message_id(self, message_id: str, subject_fallback: str = ""):
+        """Launch/focus Outlook and Display() the item matching the given
+        Message-ID header. Falls back to a Subject search if the
+        Message-ID can't be matched (e.g. Outlook hasn't synced it yet)."""
+        if not _OUTLOOK_COM_AVAILABLE:
+            return
         pythoncom.CoInitialize()
         try:
             if self.outlook is None:
-                self.connect()
+                self._connect()
 
-            self._force_send_receive()
+            item = self._find_by_message_id(message_id) if message_id else None
+            if item is None and subject_fallback:
+                item = self._find_by_subject(subject_fallback)
 
-            new_events = []
-            snapshot = {}
+            if item is not None:
+                item.Display()
 
-            with self._lock:
-                try:
-                    stores = list(self.namespace.Stores)
-                except pywintypes.com_error:
-                    # The MAPI session can drop mid-sync (e.g. Outlook was
-                    # restarted, or a transient server disconnect). Reconnect
-                    # once and retry this poll rather than crashing the loop.
-                    self.connect()
-                    stores = list(self.namespace.Stores)
-
-                for store in stores:
-                    try:
-                        store_name = store.DisplayName
-                    except Exception:
-                        continue
-
-                    total_unread = 0
-                    current_unread_ids = set()
-                    messages = []
-
-                    folder = self._get_inbox_folder(store)
-                    if folder is not None:
-                        try:
-                            total_unread = folder.UnReadItemCount
-                        except Exception:
-                            total_unread = 0
-
-                        # Identify the actual unread items so we can detect
-                        # "new" mail, notify with sender/subject, and show
-                        # a message list in the Account Breakdown popup.
-                        try:
-                            items = folder.Items
-                            items = items.Restrict("[UnRead] = true")
-                            items.Sort("[ReceivedTime]", True)
-                            for item in items:
-                                try:
-                                    entry_id = item.EntryID
-                                    current_unread_ids.add(entry_id)
-                                    messages.append(UnreadMessage(
-                                        entry_id=entry_id,
-                                        sender=self._safe_sender_name(item),
-                                        subject=getattr(item, "Subject", "(no subject)") or "(no subject)",
-                                        received=self._format_received_time(item),
-                                    ))
-                                except Exception:
-                                    continue
-                        except Exception:
-                            pass
-
-                    prior = self.accounts.get(store_name)
-                    prior_ids = prior.seen_entry_ids if prior else set()
-
-                    # Only fire notifications after we have an established
-                    # baseline (skip the very first poll to avoid a storm
-                    # of notifications for pre-existing unread mail).
-                    if prior is not None:
-                        newly_unread_ids = current_unread_ids - prior_ids
-                        for entry_id in newly_unread_ids:
-                            try:
-                                item = self.namespace.GetItemFromID(entry_id)
-                                new_events.append({
-                                    "account": store_name,
-                                    "sender": self._safe_sender_name(item),
-                                    "subject": getattr(item, "Subject", "(no subject)"),
-                                    "entry_id": entry_id,
-                                    "store_id": store.StoreID,
-                                })
-                            except Exception:
-                                continue
-
-                    self.accounts[store_name] = AccountStatus(
-                        name=store_name,
-                        unread=total_unread,
-                        seen_entry_ids=current_unread_ids,
-                        messages=messages,
-                    )
-                    snapshot[store_name] = AccountStatus(
-                        name=store_name,
-                        unread=total_unread,
-                        seen_entry_ids=current_unread_ids,
-                        messages=messages,
-                    )
-
-            total = sum(status.unread for status in snapshot.values())
-            return total, snapshot, new_events
-        finally:
-            pythoncom.CoUninitialize()
-
-    @staticmethod
-    def _safe_sender_name(item):
-        for attr in ("SenderName", "SenderEmailAddress"):
-            try:
-                val = getattr(item, attr)
-                if val:
-                    return val
-            except Exception:
-                continue
-        return "Unknown Sender"
-
-    @staticmethod
-    def _format_received_time(item):
-        try:
-            received = item.ReceivedTime
-            return received.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            return ""
-
-    def open_item_and_foreground(self, entry_id):
-        """Open the given item in Outlook and bring Outlook to front."""
-        pythoncom.CoInitialize()
-        try:
-            item = self.namespace.GetItemFromID(entry_id)
-            item.Display()  # opens the Outlook item window
             self._foreground_outlook()
         except Exception:
             traceback.print_exc()
         finally:
             pythoncom.CoUninitialize()
 
+    def _find_by_message_id(self, message_id: str):
+        PR_INTERNET_MESSAGE_ID = "http://schemas.microsoft.com/mapi/proptag/0x1035001F"
+        try:
+            for store in self.namespace.Stores:
+                inbox = store.GetDefaultFolder(6)  # olFolderInbox
+                items = inbox.Items
+                for item in items:
+                    try:
+                        mapi_id = item.PropertyAccessor.GetProperty(PR_INTERNET_MESSAGE_ID)
+                    except Exception:
+                        continue
+                    if mapi_id and mapi_id.strip() == message_id.strip():
+                        return item
+        except Exception:
+            pass
+        return None
+
+    def _find_by_subject(self, subject: str):
+        try:
+            for store in self.namespace.Stores:
+                inbox = store.GetDefaultFolder(6)
+                items = inbox.Items
+                items.Sort("[ReceivedTime]", True)
+                restricted = items.Restrict(
+                    "[Subject] = \"" + subject.replace('"', '') + "\""
+                )
+                for item in restricted:
+                    return item
+        except Exception:
+            pass
+        return None
+
     @staticmethod
     def _foreground_outlook():
-        """Best-effort: bring the Outlook main/item window to the foreground."""
         def enum_handler(hwnd, results):
             if not win32gui.IsWindowVisible(hwnd):
                 return
@@ -293,18 +356,15 @@ class OutlookMonitor:
 # ------------------------------------------------------------------------
 
 def make_badge_icon(count: int) -> Image.Image:
-    """Render a simple envelope-style icon with a numeric unread badge."""
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Simple envelope base
     envelope_color = (33, 115, 199, 255) if count > 0 else (120, 120, 120, 255)
     draw.rounded_rectangle([4, 14, 60, 50], radius=6, fill=envelope_color)
     draw.polygon([(4, 14), (32, 36), (60, 14)], fill=(255, 255, 255, 60))
 
     if count > 0:
-        # Red badge circle in the top-right corner
         badge_radius = 20
         cx, cy = size - badge_radius + 4, badge_radius - 4
         draw.ellipse(
@@ -330,8 +390,6 @@ def make_badge_icon(count: int) -> Image.Image:
 # ------------------------------------------------------------------------
 
 class Notifier:
-    """Thin wrapper that normalizes windows-toasts / win10toast differences."""
-
     def __init__(self, on_click):
         self.on_click = on_click
         self._toaster = None
@@ -340,7 +398,7 @@ class Notifier:
         elif _NOTIFY_BACKEND == "win10toast":
             self._toaster = ToastNotifier()
 
-    def notify(self, account, sender, subject, entry_id):
+    def notify(self, account, sender, subject, message_id):
         title = f"{account}: New Mail"
         message = f"From: {sender}\n{subject}"
 
@@ -349,13 +407,11 @@ class Notifier:
             toast.text_fields = [title, message]
 
             def _activated(_args: ToastActivatedEventArgs):
-                self.on_click(entry_id)
+                self.on_click(message_id, subject)
 
             toast.on_activated = _activated
             self._toaster.show_toast(toast)
         elif _NOTIFY_BACKEND == "win10toast":
-            # win10toast has no reliable click callback; notify only.
-            # Run in a thread since it can block briefly.
             threading.Thread(
                 target=self._toaster.show_toast,
                 kwargs=dict(title=title, msg=message, duration=8, threaded=True),
@@ -370,9 +426,11 @@ class Notifier:
 # ------------------------------------------------------------------------
 
 class MailPulseApp:
-    def __init__(self):
-        self.monitor = OutlookMonitor()
+    def __init__(self, accounts):
+        self.monitor = ImapMonitor(accounts)
+        self.outlook_launcher = OutlookLauncher() if _OUTLOOK_COM_AVAILABLE else None
         self.notifier = Notifier(on_click=self._handle_notification_click)
+
         self.icon = pystray.Icon(APP_NAME)
         self.icon.icon = make_badge_icon(0)
         self.icon.title = f"{APP_NAME} - starting..."
@@ -382,9 +440,10 @@ class MailPulseApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", self._on_exit),
         )
+
         self._stop_event = threading.Event()
         self._last_snapshot = {}
-        self._breakdown_window = None  # set while the breakdown popup is open
+        self._breakdown_window = None
 
     # -- background polling loop -----------------------------------------
 
@@ -398,19 +457,24 @@ class MailPulseApp:
             total, snapshot, new_events = self.monitor.poll()
         except Exception:
             traceback.print_exc()
-            self.icon.title = f"{APP_NAME} - Outlook not available"
+            self.icon.title = f"{APP_NAME} - error checking mail"
             return
 
         self._last_snapshot = snapshot
         self.icon.icon = make_badge_icon(total)
-        self.icon.title = f"{APP_NAME} - {total} unread"
+
+        errors = [s.name for s in snapshot.values() if s.error]
+        if errors:
+            self.icon.title = f"{APP_NAME} - {total} unread ({len(errors)} account(s) failed)"
+        else:
+            self.icon.title = f"{APP_NAME} - {total} unread"
 
         for event in new_events:
             self.notifier.notify(
                 account=event["account"],
                 sender=event["sender"],
                 subject=event["subject"],
-                entry_id=event["entry_id"],
+                message_id=event["message_id"],
             )
 
     # -- menu handlers -----------------------------------------------------
@@ -419,8 +483,6 @@ class MailPulseApp:
         threading.Thread(target=self._do_poll, daemon=True).start()
 
     def _on_account_breakdown(self, icon, item):
-        # Only one breakdown window at a time; Tkinter must run its own
-        # mainloop on a dedicated thread since pystray owns the main thread.
         if self._breakdown_window is not None:
             return
         threading.Thread(target=self._run_breakdown_window, daemon=True).start()
@@ -435,8 +497,9 @@ class MailPulseApp:
         root.attributes("-topmost", True)
         root.geometry("480x420")
 
-        header = tk.Label(root, text="Unread by Account", font=("Segoe UI", 12, "bold"))
-        header.pack(padx=16, pady=(12, 6), anchor="w")
+        tk.Label(root, text="Unread by Account", font=("Segoe UI", 12, "bold")).pack(
+            padx=16, pady=(12, 6), anchor="w"
+        )
 
         container = tk.Frame(root)
         container.pack(fill="both", expand=True, padx=16, pady=(0, 8))
@@ -450,7 +513,6 @@ class MailPulseApp:
         )
         canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
-
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
@@ -476,47 +538,36 @@ class MailPulseApp:
                 return
 
             for name, status in sorted(self._last_snapshot.items()):
-                account_label = tk.Label(
-                    scroll_frame,
-                    text=f"{name}  ({status.unread} unread)",
-                    font=("Segoe UI", 10, "bold"),
-                    anchor="w",
-                )
-                account_label.pack(fill="x", pady=(10, 2))
+                label_text = f"{name}  ({status.unread} unread)"
+                if status.error:
+                    label_text += "  [connection error]"
+                tk.Label(
+                    scroll_frame, text=label_text, font=("Segoe UI", 10, "bold"), anchor="w"
+                ).pack(fill="x", pady=(10, 2))
 
-                if not status.messages:
-                    tk.Label(scroll_frame, text="  (no unread mail)", fg="gray").pack(
-                        anchor="w"
-                    )
+                if status.error:
+                    tk.Label(scroll_frame, text=f"  {status.error}", fg="red").pack(anchor="w")
+                elif not status.messages:
+                    tk.Label(scroll_frame, text="  (no unread mail)", fg="gray").pack(anchor="w")
                 for msg in status.messages:
                     row = tk.Frame(scroll_frame)
                     row.pack(fill="x", pady=1)
                     tk.Label(
-                        row,
-                        text=f"  {msg.received}",
-                        font=("Segoe UI", 8),
-                        fg="gray",
-                        width=14,
-                        anchor="w",
+                        row, text=f"  {msg.received}", font=("Segoe UI", 8), fg="gray",
+                        width=14, anchor="w",
                     ).pack(side="left")
                     tk.Label(
-                        row,
-                        text=f"{msg.sender} — {msg.subject}",
-                        font=("Segoe UI", 9),
-                        anchor="w",
-                        wraplength=320,
-                        justify="left",
+                        row, text=f"{msg.sender} — {msg.subject}", font=("Segoe UI", 9),
+                        anchor="w", wraplength=320, justify="left",
                     ).pack(side="left", fill="x", expand=True)
 
-            total = sum(status.unread for status in self._last_snapshot.values())
+            total = sum(s.unread for s in self._last_snapshot.values())
             total_label.config(text=f"Total: {total}")
 
         def auto_refresh():
             if self._breakdown_window is None:
-                return  # window was closed
+                return
             render()
-            # Re-check slightly more often than the poll interval so the
-            # popup picks up each new result promptly after it lands.
             root.after(2000, auto_refresh)
 
         auto_refresh()
@@ -526,9 +577,13 @@ class MailPulseApp:
         self._stop_event.set()
         icon.stop()
 
-    def _handle_notification_click(self, entry_id):
+    def _handle_notification_click(self, message_id, subject):
+        if self.outlook_launcher is None:
+            return
         threading.Thread(
-            target=self.monitor.open_item_and_foreground, args=(entry_id,), daemon=True
+            target=self.outlook_launcher.open_by_message_id,
+            args=(message_id, subject),
+            daemon=True,
         ).start()
 
     # -- entrypoint ----------------------------------------------------------
@@ -540,10 +595,20 @@ class MailPulseApp:
 
 def main():
     if sys.platform != "win32":
-        print("MailPulse Tray requires Windows (Outlook COM automation).")
+        print("MailPulse Tray requires Windows.")
         sys.exit(1)
 
-    app = MailPulseApp()
+    try:
+        accounts = load_accounts()
+    except Exception as exc:
+        print(f"Failed to load {CONFIG_PATH}: {exc}")
+        sys.exit(1)
+
+    if not accounts:
+        print("No accounts configured in config.json.")
+        sys.exit(1)
+
+    app = MailPulseApp(accounts)
     app.run()
 
 

@@ -1,0 +1,22 @@
+{
+  "accounts": [
+    {
+      "name": "Support Inbox",
+      "imap_server": "mail.example-cpanel-host.com",
+      "imap_port": 993,
+      "use_ssl": true,
+      "email": "support@example.com",
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "mailbox": "INBOX"
+    },
+    {
+      "name": "Sales Inbox",
+      "imap_server": "mail.example-cpanel-host.com",
+      "imap_port": 993,
+      "use_ssl": true,
+      "email": "sales@example.com",
+      "password": "REPLACE_WITH_YOUR_PASSWORD",
+      "mailbox": "INBOX"
+    }
+  ]
+}
