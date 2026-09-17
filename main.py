@@ -26,6 +26,13 @@ Architecture
   password itself is stored securely in Windows Credential Manager via
   the `keyring` package, keyed by account email, so it never sits in
   plaintext on disk.
+- The same Settings window also has a Notifications section: how often
+  to check for new mail (poll interval), and an optional recurring
+  "unread follow-up" reminder toast (Never / 15 / 30 / 60 min) that fires
+  if unread mail is still sitting in the inbox after that many minutes.
+  Both are persisted in settings.json and restored on the next launch.
+  Clicking a reminder toast opens the same Unread Mail list window as a
+  tray left-click.
 
 This file is single-file and dependency-light so it can be frozen into a
 single .exe with PyInstaller. See README.md for packaging steps.
@@ -38,6 +45,7 @@ import json
 import os
 import sys
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
@@ -73,20 +81,28 @@ except ImportError:
 
 
 APP_NAME = "MailPulse Tray"
-POLL_INTERVAL_SECONDS = 20
+DEFAULT_POLL_INTERVAL_SECONDS = 20
+DEFAULT_REMINDER_INTERVAL_MINUTES = 0  # 0 = Never
 ACCOUNTS_FILENAME = "accounts.json"
+SETTINGS_FILENAME = "settings.json"
 KEYRING_SERVICE = "MailPulseTray"
+
+# Selectable options shown in the Settings window's dropdowns.
+NOTIFICATION_DELAY_OPTIONS_SECONDS = [15, 20, 30, 60, 120, 300]
+REMINDER_OPTIONS_MINUTES = [0, 15, 30, 60]  # 0 = Never
 
 
 def _base_dir():
-    """Directory the .exe (or script) lives in, so accounts.json sits next
-    to it whether running from source or as a frozen PyInstaller build."""
+    """Directory the .exe (or script) lives in, so accounts.json/settings.json
+    sit next to it whether running from source or as a frozen PyInstaller
+    build."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
 ACCOUNTS_PATH = os.path.join(_base_dir(), ACCOUNTS_FILENAME)
+SETTINGS_PATH = os.path.join(_base_dir(), SETTINGS_FILENAME)
 
 
 # ------------------------------------------------------------------------
@@ -169,6 +185,46 @@ class AccountStore:
         updated = [a for a in accounts if a.id != account_id]
         self.save(updated)
         return updated
+
+
+# ------------------------------------------------------------------------
+# App settings -- non-secret notification timing preferences, persisted
+# to settings.json next to accounts.json.
+# ------------------------------------------------------------------------
+
+@dataclass
+class AppSettings:
+    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
+    reminder_interval_minutes: int = DEFAULT_REMINDER_INTERVAL_MINUTES  # 0 = Never
+
+
+class SettingsStore:
+    def __init__(self, path=SETTINGS_PATH):
+        self.path = path
+
+    def load(self) -> AppSettings:
+        if not os.path.exists(self.path):
+            return AppSettings()
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return AppSettings(
+                poll_interval_seconds=int(
+                    raw.get("poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS)
+                ),
+                reminder_interval_minutes=int(
+                    raw.get("reminder_interval_minutes", DEFAULT_REMINDER_INTERVAL_MINUTES)
+                ),
+            )
+        except Exception:
+            return AppSettings()
+
+    def save(self, settings: AppSettings):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({
+                "poll_interval_seconds": settings.poll_interval_seconds,
+                "reminder_interval_minutes": settings.reminder_interval_minutes,
+            }, f, indent=2)
 
 
 # ------------------------------------------------------------------------
@@ -445,26 +501,27 @@ def make_badge_icon(count: int) -> Image.Image:
 # ------------------------------------------------------------------------
 
 class Notifier:
-    def __init__(self, on_click):
-        self.on_click = on_click
+    """Shows toast notifications. Each toast carries its own on-click
+    callback, so a "new mail" toast can deep-link into Outlook while a
+    "unread reminder" toast can instead open the Unread Mail list."""
+
+    def __init__(self):
         self._toaster = None
         if _NOTIFY_BACKEND == "windows_toasts":
             self._toaster = WindowsToaster(APP_NAME)
         elif _NOTIFY_BACKEND == "win10toast":
             self._toaster = ToastNotifier()
 
-    def notify(self, account, sender, subject, message_id):
-        title = f"{account}: New Mail"
-        message = f"From: {sender}\n{subject}"
-
+    def notify(self, title, message, on_click=None):
         if _NOTIFY_BACKEND == "windows_toasts":
             toast = Toast()
             toast.text_fields = [title, message]
 
-            def _activated(_args: ToastActivatedEventArgs):
-                self.on_click(message_id, subject)
+            if on_click is not None:
+                def _activated(_args: ToastActivatedEventArgs):
+                    on_click()
 
-            toast.on_activated = _activated
+                toast.on_activated = _activated
             self._toaster.show_toast(toast)
         elif _NOTIFY_BACKEND == "win10toast":
             threading.Thread(
@@ -475,18 +532,35 @@ class Notifier:
         else:
             print(f"[Notification] {title} -- {message}")
 
+    def notify_new_mail(self, account, sender, subject, on_click=None):
+        self.notify(
+            title=f"{account}: New Mail",
+            message=f"From: {sender}\n{subject}",
+            on_click=on_click,
+        )
+
+    def notify_unread_reminder(self, unread_count, on_click=None):
+        plural = "email" if unread_count == 1 else "emails"
+        self.notify(
+            title=f"{APP_NAME}: Unread Reminder",
+            message=f"Reminder: You still have {unread_count} unread {plural} waiting in your inbox.",
+            on_click=on_click,
+        )
+
 
 # ------------------------------------------------------------------------
 # Application
 # ------------------------------------------------------------------------
 
 class MailPulseApp:
-    def __init__(self, account_store: AccountStore):
+    def __init__(self, account_store: AccountStore, settings_store: SettingsStore):
         self.account_store = account_store
         self.accounts = account_store.load()
+        self.settings_store = settings_store
+        self.settings = settings_store.load()
         self.monitor = ImapMonitor(self.accounts)
         self.outlook_launcher = OutlookLauncher() if _OUTLOOK_COM_AVAILABLE else None
-        self.notifier = Notifier(on_click=self._handle_notification_click)
+        self.notifier = Notifier()
 
         self.icon = pystray.Icon(APP_NAME)
         self.icon.icon = make_badge_icon(0)
@@ -507,13 +581,14 @@ class MailPulseApp:
         self._breakdown_window = None
         self._settings_window = None
         self._unread_list_window = None
+        self._last_reminder_at = time.monotonic()
 
     # -- background polling loop -----------------------------------------
 
     def _poll_loop(self):
         while not self._stop_event.is_set():
             self._do_poll()
-            self._stop_event.wait(POLL_INTERVAL_SECONDS)
+            self._stop_event.wait(self.settings.poll_interval_seconds)
 
     def _do_poll(self):
         try:
@@ -533,11 +608,30 @@ class MailPulseApp:
             self.icon.title = f"{APP_NAME} - {total} unread"
 
         for event in new_events:
-            self.notifier.notify(
+            self.notifier.notify_new_mail(
                 account=event["account"],
                 sender=event["sender"],
                 subject=event["subject"],
-                message_id=event["message_id"],
+                on_click=lambda mid=event["message_id"], subj=event["subject"]:
+                    self._open_in_outlook(mid, subj),
+            )
+
+        self._maybe_fire_unread_reminder(total)
+
+    def _maybe_fire_unread_reminder(self, total_unread):
+        """If a reminder interval is configured (non-zero) and that many
+        minutes have passed since the last reminder, and unread mail is
+        still sitting in the inbox, fire a follow-up toast."""
+        interval_minutes = self.settings.reminder_interval_minutes
+        if interval_minutes <= 0 or total_unread <= 0:
+            self._last_reminder_at = time.monotonic()
+            return
+
+        elapsed = time.monotonic() - self._last_reminder_at
+        if elapsed >= interval_minutes * 60:
+            self._last_reminder_at = time.monotonic()
+            self.notifier.notify_unread_reminder(
+                total_unread, on_click=self._on_tray_left_click_from_notification
             )
 
     # -- menu handlers -----------------------------------------------------
@@ -597,15 +691,6 @@ class MailPulseApp:
 
         root.protocol("WM_DELETE_WINDOW", on_close)
 
-        def open_in_outlook(message_id, subject):
-            if self.outlook_launcher is None:
-                return
-            threading.Thread(
-                target=self.outlook_launcher.open_by_message_id,
-                args=(message_id, subject),
-                daemon=True,
-            ).start()
-
         def render():
             for child in scroll_frame.winfo_children():
                 child.destroy()
@@ -664,7 +749,8 @@ class MailPulseApp:
                 for widget in clickable_widgets:
                     widget.bind(
                         "<Button-1>",
-                        lambda e, mid=msg.message_id, subj=msg.subject: open_in_outlook(mid, subj),
+                        lambda e, mid=msg.message_id, subj=msg.subject:
+                            self._open_in_outlook(mid, subj),
                     )
 
         def auto_refresh():
@@ -780,7 +866,7 @@ class MailPulseApp:
         self._settings_window = root
         root.title(f"{APP_NAME} - Settings")
         root.attributes("-topmost", True)
-        root.geometry("560x380")
+        root.geometry("560x520")
 
         tk.Label(root, text="Email Accounts", font=("Segoe UI", 12, "bold")).pack(
             padx=16, pady=(12, 6), anchor="w"
@@ -843,12 +929,68 @@ class MailPulseApp:
         tk.Button(button_row, text="Add Account", command=on_add).pack(side="left")
         tk.Button(button_row, text="Edit", command=on_edit).pack(side="left", padx=(8, 0))
         tk.Button(button_row, text="Delete", command=on_delete).pack(side="left", padx=(8, 0))
-        tk.Button(button_row, text="Close", command=root.destroy).pack(side="right")
+
+        # -- Notification timing preferences --------------------------------
+        ttk.Separator(root, orient="horizontal").pack(fill="x", padx=16, pady=(10, 4))
+
+        tk.Label(root, text="Notifications", font=("Segoe UI", 12, "bold")).pack(
+            padx=16, pady=(6, 6), anchor="w"
+        )
+
+        def format_seconds(s):
+            return f"{s} sec" if s < 60 else f"{s // 60} min"
+
+        def format_minutes(m):
+            return "Never" if m <= 0 else f"Every {m} min" if m < 60 else f"Every {m // 60} hr"
+
+        delay_row = tk.Frame(root)
+        delay_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(delay_row, text="Check for new email every:", width=26, anchor="w").pack(
+            side="left"
+        )
+        delay_display_to_value = {
+            format_seconds(s): s for s in NOTIFICATION_DELAY_OPTIONS_SECONDS
+        }
+        delay_var = tk.StringVar(value=format_seconds(self.settings.poll_interval_seconds))
+        delay_combo = ttk.Combobox(
+            delay_row, textvariable=delay_var, state="readonly",
+            values=list(delay_display_to_value.keys()), width=14,
+        )
+        delay_combo.pack(side="left")
+
+        reminder_row = tk.Frame(root)
+        reminder_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(reminder_row, text="Unread follow-up reminder:", width=26, anchor="w").pack(
+            side="left"
+        )
+        reminder_display_to_value = {
+            format_minutes(m): m for m in REMINDER_OPTIONS_MINUTES
+        }
+        reminder_var = tk.StringVar(
+            value=format_minutes(self.settings.reminder_interval_minutes)
+        )
+        reminder_combo = ttk.Combobox(
+            reminder_row, textvariable=reminder_var, state="readonly",
+            values=list(reminder_display_to_value.keys()), width=14,
+        )
+        reminder_combo.pack(side="left")
+
+        def on_save_notifications():
+            self.settings.poll_interval_seconds = delay_display_to_value[delay_var.get()]
+            self.settings.reminder_interval_minutes = reminder_display_to_value[reminder_var.get()]
+            self.settings_store.save(self.settings)
+            self._last_reminder_at = time.monotonic()
+            messagebox.showinfo(APP_NAME, "Notification settings saved.", parent=root)
+
+        tk.Button(root, text="Save Notification Settings", command=on_save_notifications).pack(
+            anchor="w", padx=16, pady=(8, 4)
+        )
 
         def on_close():
             self._settings_window = None
             root.destroy()
 
+        tk.Button(root, text="Close", command=on_close).pack(pady=(10, 12))
         root.protocol("WM_DELETE_WINDOW", on_close)
         root.mainloop()
 
@@ -937,7 +1079,7 @@ class MailPulseApp:
         self._stop_event.set()
         icon.stop()
 
-    def _handle_notification_click(self, message_id, subject):
+    def _open_in_outlook(self, message_id, subject):
         if self.outlook_launcher is None:
             return
         threading.Thread(
@@ -945,6 +1087,12 @@ class MailPulseApp:
             args=(message_id, subject),
             daemon=True,
         ).start()
+
+    def _on_tray_left_click_from_notification(self):
+        """Click handler for the unread-reminder toast: opens the same
+        Unread Mail list window as a tray left-click, so the user can
+        see and act on their unread mail immediately."""
+        self._on_tray_left_click(self.icon, None)
 
     # -- entrypoint ----------------------------------------------------------
 
@@ -958,7 +1106,7 @@ def main():
         print("MailPulse Tray requires Windows.")
         sys.exit(1)
 
-    app = MailPulseApp(AccountStore())
+    app = MailPulseApp(AccountStore(), SettingsStore())
     if not app.accounts:
         # First run / no accounts configured yet -- open Settings so the
         # user can add an account instead of hand-editing a file.

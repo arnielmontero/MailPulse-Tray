@@ -4,3 +4,4 @@ build/
 dist/
 *.spec
 accounts.json
+settings.json

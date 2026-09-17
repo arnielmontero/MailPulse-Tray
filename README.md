@@ -60,6 +60,23 @@ Accounts are added entirely through the app's UI:
   control panel under "Generic Credentials" (look for entries prefixed
   `MailPulseTray`).
 
+### Notification timing
+
+The same Settings window has a **Notifications** section:
+
+- **Check for new email every:** how often the app polls IMAP (also
+  controls how quickly the tray badge and new-mail toasts update).
+  Options: 15 sec, 20 sec, 30 sec, 1 min, 2 min, 5 min.
+- **Unread follow-up reminder:** an optional recurring toast reminding you
+  of mail still sitting unread ("Reminder: You still have N unread emails
+  waiting in your inbox"), fired only while unread mail remains. Options:
+  Never, every 15 min, every 30 min, every 1 hr. Clicking this toast opens
+  the same Unread Mail list window as a tray left-click.
+
+Click **Save Notification Settings** to apply and persist these — they're
+stored in `settings.json` (next to `accounts.json`) and restored
+automatically on the next launch.
+
 ## 3. Run from source (optional, for testing)
 
 ```bash
